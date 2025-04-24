@@ -1,4 +1,5 @@
 import dns.resolver
+import os
 import argparse
 import sys
 import ssl
@@ -6,6 +7,7 @@ import socket
 import getpass
 import asyncio
 import copy
+import csv
 from msldap.connection import MSLDAPClientConnection
 from msldap.commons.factory import LDAPConnectionFactory
 from msldap.commons.target import MSLDAPTarget, UniProto
@@ -69,7 +71,7 @@ async def run_ldaps_withEPA(cred, dcTarget, timeout = 10):
         elif "data 52e" in str(err):
             return False
         elif err is not None:
-            print("ERROR while connecting to " + dcTarget + ": " + err)
+            print("ERROR while connecting to " + dcTarget + ": " + str(err))
         elif err is None:
             return False
 
@@ -194,54 +196,71 @@ async def run_ldap(cred, dcTarget, timeout = 5):
         print("\n   [!] "+ dcTarget+" -", str(e))
         return False
 
-async def amain(method, dc_ip, fqdn, domainUser, password, timeout = 10):
-    try:
-        dcList = ResolveDCs(dc_ip, fqdn)
-    except Exception as e:
-        print("Error resolving DCs: " + str(e))
-        exit()
-    print("\n~Domain Controllers identified~")
-    for dc in dcList:
-        print("   " + dc)
-
+async def amain(method, dcList, fqdn, domainUser, password, timeout = 10, ouput_csv):
     print("\n~Checking DCs for LDAP NTLM relay protections~")
     
-    #print("VALUES AUTHING WITH:\nUser: "+domainUser+"\nPass: " +password + "\nDomain:  "+fqdn)
+    print("Authentication:\nUser: "+domainUser+"\nPass: " +password + "\nDomain:  "+fqdn)
 
     cred = UniCredential(password, username=domainUser, domain=fqdn, stype=asyauthSecret.PASSWORD, protocol=asyauthProtocol.NTLM)
-
+    results = [("ip", "LDAP signing", "Channel Binding")]
     for dc in dcList:
         print("   " + dc)
         try:
             if method == "BOTH":
                 ldapIsProtected = await run_ldap(copy.deepcopy(cred), dc, timeout = timeout)
                 if ldapIsProtected == False:
+                    ldap_signing_res = "Not enforced"
                     print("      [+] (LDAP)  SERVER SIGNING REQUIREMENTS NOT ENFORCED! ")
                 elif ldapIsProtected == True:
                     print("      [-] (LDAP)  server enforcing signing requirements")
+                    ldap_signing_res = "Enforced"
+            else:
+                ldap_signing_res = "Not Tested"
             if DoesLdapsCompleteHandshake(dc) == True:
                 ldapsChannelBindingAlwaysCheck = await run_ldaps_noEPA(copy.deepcopy(cred), dc, timeout=timeout)
                 ldapsChannelBindingWhenSupportedCheck = await run_ldaps_withEPA(copy.deepcopy(cred), dc, timeout=timeout)
                 if ldapsChannelBindingAlwaysCheck == False and ldapsChannelBindingWhenSupportedCheck == True:
+                    channel_binding_res = "When supported"
                     print("      [-] (LDAPS) channel binding is set to \"when supported\" - this")
                     print("                  may prevent an NTLM relay depending on the client's")
                     print("                  support for channel binding.")
                 elif ldapsChannelBindingAlwaysCheck == False and ldapsChannelBindingWhenSupportedCheck == False:
+                        channel_binding_res = "Never"
                         print("      [+] (LDAPS) CHANNEL BINDING SET TO \"NEVER\"! PARTY TIME!")
                 elif ldapsChannelBindingAlwaysCheck == True:
+                    channel_binding_res = "Required"
                     print("      [-] (LDAPS) channel binding set to \"required\", no fun allowed")
                 else:
+                    channel_binding_res = "Unknown Error"
                     print("\nSomething went wrong...")
                     print("For troubleshooting:\nldapsChannelBindingAlwaysCheck - " +str(ldapsChannelBindingAlwaysCheck)+"\nldapsChannelBindingWhenSupportedCheck: "+str(ldapsChannelBindingWhenSupportedCheck))
                     exit()
-                #print("For troubleshooting:\nldapsChannelBindingAlwaysCheck - " +str(ldapsChannelBindingAlwaysCheck)+"\nldapsChannelBindingWhenSupportedCheck: "+str(ldapsChannelBindingWhenSupportedCheck))
                     
             elif DoesLdapsCompleteHandshake(dc) == False:
+                channel_binding_res = "TLS failure - LDAPS likely not configured"
                 print("      [!] "+dc+ " - cannot complete TLS handshake, cert likely not configured")
         except Exception as e:
             print("      [-] ERROR: " + str(e))
+        results.append((dc, ldap_signing_res, channel_binding_res))
     print()
+    
+    if ouput_csv:
+        with open(ouput_csv, mode = "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerows(results)
+        print(f"output saved to {ouput_csv}")
+    
 
+def parse_dc_ips(single_ip, ip_list_path):
+    if ip_list_path:
+        if not os.path.isfile(ip_list_path):
+            sys.exit(f"Error: File not found - {ip_list_path}")
+        with open(ip_list_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    elif single_ip:
+        return [single_ip.strip()]
+    else:
+        sys.exit("Error: You must specify either -dc-ip or -dc-ip-list.")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -250,8 +269,12 @@ def main():
                                     + "Alternatively you can check for both LDAPS and LDAP (server signing) protections. This requires a successful LDAP bind.")
     parser.add_argument('-method', choices=['LDAPS','BOTH'], default='LDAPS', metavar="method", action='store',
                         help="LDAPS or BOTH - LDAPS checks for channel binding, BOTH checks for LDAP signing and LDAP channel binding [authentication required]")
-    parser.add_argument('-dc-ip', required=True, action='store',
-                        help='DNS Nameserver on network. Any DC\'s IPv4 address should work.')
+    parser.add_argument('-dc-ip', action='store',
+                        help='Any DC\'s IPv4 address should work.')
+    parser.add_argument('-dc-ip-list', action='store',
+                        help='List of IPv4 DC IPs')
+    parser.add_argument('-d', default='', metavar='domain',action='store',
+                        help='FQDN or Netbios Domain name.')
     parser.add_argument('-u', default='guest', metavar='username',action='store',
                         help='Domain username value.')
     parser.add_argument('-timeout', default=10, metavar='timeout',action='store', type=int,
@@ -260,21 +283,23 @@ def main():
                         help='Domain username value.')
     parser.add_argument('-nthash', metavar='nthash',action='store',
                         help='NT hash of password')
+    parser.add_argument('-out-csv', metavar='outputcsv',action='store',
+                        help='csv path for storing output results')
     options = parser.parse_args()
+    if not options.dc_ip and not options.dc_ip_list:
+        parser.error("You must specify either --dc-ip or --dc-ip-list.")
+    dc_ips = parse_dc_ips(options.dc_ip, options.dc_ip_list)
+    
     domainUser = options.u
-
     password = options.p
 
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
     
-    if options.dc_ip == None:
-        print("-dc-ip is required")
-        exit()
     if options.method == 'BOTH':
         if domainUser == 'guest':
-            print("[i] Using BOTH method requires a username parameter")
+            print("[i] Using BOTH method requires username, password, domain parameter")
             exit()
     if options.method == 'BOTH' and options.u != 'guest' and (options.p != 'defaultpass' or options.nthash != None):
         if options.p == 'defaultpass' and options.nthash != None:
@@ -286,9 +311,10 @@ def main():
 
     if options.method =='BOTH' and options.p == 'defaultpass' and options.nthash == None:   
         password = getpass.getpass(prompt="Password: ")
-    fqdn = asyncio.run(InternalDomainFromAnonymousLdap(options.dc_ip))
+    ouput_csv = options.out_csv
+    domain_name = options.d if options.d else asyncio.run(InternalDomainFromAnonymousLdap(options.dc_ip))
 
-    asyncio.run(amain(options.method, options.dc_ip, fqdn, domainUser, password))
+    asyncio.run(amain(options.method, dc_ips, domain_name, domainUser, password, ouput_csv))
     
 
 if __name__ == '__main__':
